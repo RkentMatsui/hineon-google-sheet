@@ -1,0 +1,18 @@
+{
+	"require": {
+		"google/apiclient": "^2.15.0"
+	},
+	"config": {
+		"optimize-autoloader": true
+	},
+	"scripts": {
+		"post-update-cmd": [
+			"Google\\Task\\Composer::cleanup"
+		]
+	},
+	"extra": {
+		"google/apiclient-services": [
+			"Sheets"
+		]
+	}
+}

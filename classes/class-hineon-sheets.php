@@ -1,0 +1,519 @@
+<?php
+
+use Google_Client;
+use Google_Service_Sheets;
+use Google_Service_Sheets_Spreadsheet;
+use Google_Service_Sheets_ValueRange;
+use Google_Service_Sheets_Request;
+use Google_Service_Sheets_BatchUpdateSpreadsheetRequest;
+use Google_Service_Sheets_ClearValuesRequest;
+use Exception;
+
+class HineonSheets {
+	/**
+	 * Instance of this class
+	 *
+	 * @var null
+	 */
+	private static $instance = null;
+	/**
+	 * Instance Control
+	 */
+	public static function get_instance() {
+		if ( is_null( self::$instance ) ) {
+			self::$instance = new self();
+		}
+		return self::$instance;
+	}
+	/**
+	 * Class Constructor.
+	 */
+	public function __construct() {
+		add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
+		add_action( 'admin_menu', array( $this, 'add_export_orders_submenu_page' ) );
+		add_action( 'woocommerce_new_order', array( $this, 'auto_export_to_sheets' ) );
+		add_action( 'woocommerce_order_status_changed', array( $this, 'auto_export_to_sheets' ) );
+		add_action( 'do_hineon_sheets_export', array( $this, 'do_sheets_export' ) );
+		//add_action( 'wp_footer', array( $this, 'debug' ) );
+	}
+
+	/**
+	 * Debug
+	 */
+
+	/**
+	 * Register REST API routes
+	 */
+	public function register_rest_routes() {
+		register_rest_route(
+			'hineon/v1',
+			'/hineon_orders',
+			array(
+				'methods' => 'GET',
+				'callback' => array( $this, 'get_hineon_orders' ),
+				'permission_callback' => array( $this, 'verify_api_key' ),
+			)
+		);
+
+	}
+
+	/**
+	 * Verify API key from request header
+	 *
+	 * @param \WP_REST_Request $request The request object
+	 * @return bool|\WP_Error
+	 */
+	public function verify_api_key( $request ) {
+		$api_key = $request->get_header( 'X-API-Key' );
+
+		if ( empty( $api_key ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				'Missing API key',
+				array( 'status' => 401 )
+			);
+		}
+
+		// Get the stored API key from WordPress options
+		$valid_key = get_field( 'hineon_api_key', 'option' );
+
+		if ( empty( $valid_key ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				'API key not configured',
+				array( 'status' => 401 )
+			);
+		}
+
+		// Compare API keys using hash_equals to prevent timing attacks
+		if ( ! hash_equals( $valid_key, $api_key ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				'Invalid API key',
+				array( 'status' => 401 )
+			);
+		}
+
+		return true;
+	}
+
+	public function get_hineon_live_orders() {
+		global $wpdb;
+
+		// Get all order IDs from 2024 onwards
+		$order_ids = $wpdb->get_col(
+			"SELECT DISTINCT p.ID FROM {$wpdb->posts} p 
+			LEFT JOIN {$wpdb->postmeta} pm1 ON p.ID = pm1.post_id AND pm1.meta_key = '_hide_order'
+			LEFT JOIN {$wpdb->postmeta} pm2 ON p.ID = pm2.post_id AND pm2.meta_key = '_is_temporary_combined_order'
+			WHERE p.post_type = 'shop_order' 
+			AND p.post_status NOT IN ('trash', 'wc-failed')
+			AND pm1.meta_value IS NULL
+			AND pm2.meta_value IS NULL
+			AND p.post_date >= '2024-01-01 00:00:00'
+			ORDER BY p.post_date DESC"
+		);
+
+
+		$response = array();
+
+		foreach ( $order_ids as $order_id ) {
+			$order = wc_get_order( $order_id );
+
+			if ( ! $order ) {
+				continue;
+			}
+
+			$customer_name = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
+			/** if 'test' is in customer name, continue */
+			if ( stripos( $customer_name, 'test' ) !== false ) {
+				continue;
+			}
+
+			$customer_id = $order->get_customer_id();
+
+			/** if customer is admin, continue */
+			if ( $customer_id && user_can( $customer_id, 'administrator' ) ) {
+				continue;
+			}
+
+
+			$items = $order->get_items();
+			$order_number = $order->get_order_number();
+
+			foreach ( $items as $item ) {
+				//get item total
+				$item_total = $item->get_total();
+
+				$response[] = array(
+					'Order ID' => $order_number,
+					'Product Item' => wp_strip_all_tags( $item->get_name() ),
+					'Customer Name' => wp_strip_all_tags( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+					'State' => wp_strip_all_tags( $order->get_billing_state() ),
+					'Country' => wp_strip_all_tags( $order->get_billing_country() ),
+					'Currency' => wp_strip_all_tags( $order->get_currency() ),
+					'Item Price' => floatval( $item_total ),
+					'Total Price' => floatval( $order->get_total() ),
+					'Order Date' => wp_strip_all_tags( $order->get_date_created()->format( 'm/d/Y' ) ),
+					'Order Status' => wp_strip_all_tags( $order->get_status() ),
+				);
+			}
+		}
+
+		return $response;
+
+	}
+
+	/**
+	 * Get orders excluding those with _hide_order meta
+	 */
+	public function get_hineon_orders() {
+
+		$response = $this->get_hineon_live_orders();
+
+		return new \WP_REST_Response( $response, 200 );
+	}
+
+	/**
+	 * Add Export Orders submenu page under WooCommerce menu
+	 */
+	public function add_export_orders_submenu_page() {
+		add_submenu_page(
+			'woocommerce',
+			'Hineon Orders Sheet',
+			'Hineon Orders Sheet',
+			'manage_woocommerce',
+			'export-orders',
+			array( $this, 'export_orders_page_content' )
+		);
+	}
+
+	/**
+	 * Display the Export Orders page content
+	 */
+	public function export_orders_page_content() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( __( 'You do not have sufficient permissions to access this page.' ) );
+		}
+
+		// Check if export button was clicked
+		if ( isset( $_GET['export_orders'] ) && $_GET['export_orders'] === '1' ) {
+			$this->export_orders_to_csv();
+			return;
+		}
+
+		// Check if Google Sheets export was requested
+		if ( isset( $_GET['export_to_sheets'] ) && $_GET['export_to_sheets'] === '1' ) {
+			$this->update_google_sheet();
+			return;
+		}
+
+		?>
+<div class="wrap">
+  <h1>Export Orders</h1>
+  <p>Click one of the buttons below to export all orders.</p>
+  <?php
+			?>
+  <div class="button-group">
+    <a href="<?php echo admin_url( 'admin.php?page=export-orders&export_orders=1' ); ?>" class="button button-primary"
+      style="margin-right: 10px;">Export to CSV</a>
+    <a href="<?php echo admin_url( 'admin.php?page=export-orders&export_to_sheets=1' ); ?>"
+      class="button button-secondary">Update Google Sheet</a>
+  </div>
+  <?php
+			// Display Google Sheets settings if they exist
+			$sheet_url = get_option( 'hineon_orders_sheet_url' );
+			$last_updated = get_option( 'hineon_orders_sheet_last_updated' );
+			if ( $sheet_url ) {
+				echo '<div class="sheet-info" style="margin-top: 20px;">';
+				echo '<p class="description">Google Sheet: <a href="' . esc_url( $sheet_url ) . '" target="_blank">View Sheet</a>';
+				if ( $last_updated ) {
+					echo '<br>Last updated: ' . date_i18n( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), strtotime( $last_updated ) );
+				}
+				echo '</p></div>';
+			}
+			?>
+</div>
+<?php
+	}
+
+	/**
+	 * Export orders to CSV file
+	 */
+	private function export_orders_to_csv() {
+		// Prevent WordPress from sending its headers
+		if ( ! headers_sent() ) {
+			// Clear any previous output
+			ob_clean();
+
+			// Prevent WordPress from processing further output
+			remove_all_actions( 'wp_headers' );
+			remove_all_actions( 'admin_head' );
+			remove_all_actions( 'admin_footer' );
+
+			// Set headers for CSV download
+			header( 'Content-Type: text/csv; charset=utf-8' );
+			header( 'Content-Disposition: attachment; filename="hineon-orders-' . date( 'Y-m-d' ) . '.csv"' );
+			header( 'Pragma: no-cache' );
+			header( 'Expires: 0' );
+		}
+
+		$orders_data = $this->get_hineon_live_orders();
+
+		if ( empty( $orders_data ) ) {
+			wp_die( 'No orders found to export.' );
+		}
+
+		// Create output stream
+		$output = fopen( 'php://output', 'w' );
+
+		// Add UTF-8 BOM for proper Excel encoding
+		fputs( $output, "\xEF\xBB\xBF" );
+
+		// Add headers
+		fputcsv( $output, array_keys( $orders_data[0] ) );
+
+		// Add data
+		foreach ( $orders_data as $row ) {
+			// Clean each field
+			$clean_row = array_map( function ($value) {
+				// First decode HTML entities
+				$decoded = html_entity_decode( $value, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+				// Then strip any remaining HTML tags
+				$stripped = wp_strip_all_tags( $decoded );
+				// Finally trim any whitespace
+				return trim( $stripped );
+			}, $row );
+
+			fputcsv( $output, $clean_row );
+		}
+
+		fclose( $output );
+		exit();
+	}
+
+	public function update_google_sheet() {
+		$this->export_orders_to_sheets();
+		// Redirect back with success message
+		wp_redirect( add_query_arg( 'sheets_export_success', '1', admin_url( 'admin.php?page=export-orders' ) ) );
+		exit;
+	}
+
+	/**
+	 * Export orders to Google Sheets
+	 */
+	private function export_orders_to_sheets() {
+		if ( ! class_exists( 'Google_Client' ) ) {
+			require_once get_template_directory() . '/vendor/autoload.php';
+		}
+
+		try {
+			$client = new Google_Client();
+			$client->setApplicationName( 'hineon Orders Export' );
+			// Set full access scope
+			$client->setScopes( [ 
+				Google_Service_Sheets::SPREADSHEETS,
+				Google_Service_Sheets::DRIVE,
+				Google_Service_Sheets::DRIVE_FILE
+			] );
+
+			// Get credentials from WordPress options
+			$spreadsheet_id = get_field( 'google_sheet_id', 'option' );
+
+			$credentials_json_file = get_field( 'google_api_json', 'option' );
+
+			$credentials = str_replace(
+				site_url(),
+				ABSPATH,
+				$credentials_json_file['url']
+			);
+
+			if ( empty( $credentials ) ) {
+				wp_die( 'Google Sheets credentials not found. Please configure them in the theme options.' );
+			}
+
+			if ( empty( $spreadsheet_id ) ) {
+				wp_die( 'Google Sheets ID not found. Please configure it in the theme options.' );
+			}
+
+			$client->setAuthConfig( $credentials );
+
+			$service = new Google_Service_Sheets( $client );
+
+			// First, try to get the spreadsheet to check permissions
+			try {
+				$spreadsheet = $service->spreadsheets->get( $spreadsheet_id );
+			} catch (Exception $e) {
+				wp_die( 'Error accessing Google Sheet. Please make sure the sheet is shared with the service account email address. Error: ' . $e->getMessage() );
+			}
+
+			// Get the orders data
+			$orders_data = $this->get_hineon_live_orders();
+			if ( empty( $orders_data ) ) {
+				wp_die( 'No orders found to export.' );
+			}
+
+			// Prepare the data for Google Sheets
+			$values = [];
+			// Add headers
+			$values[] = array_keys( $orders_data[0] );
+
+			// Add data rows
+			foreach ( $orders_data as $row ) {
+				$clean_row = array_map( function ($value) {
+					$decoded = html_entity_decode( $value, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+					$stripped = wp_strip_all_tags( $decoded );
+					return trim( $stripped );
+				}, $row );
+				$values[] = array_values( $clean_row );
+			}
+
+			// Clear the existing content
+			$clear_request = new Google_Service_Sheets_ClearValuesRequest();
+			$service->spreadsheets_values->clear( $spreadsheet_id, 'Hineon Orders', $clear_request );
+
+			$body = new Google_Service_Sheets_ValueRange( [ 
+				'values' => $values
+			] );
+
+			// Update the sheet
+			$result = $service->spreadsheets_values->update(
+				$spreadsheet_id,
+				'Hineon Orders!A1:Z',
+				$body,
+				[ 'valueInputOption' => 'RAW' ]
+			);
+
+			// Auto-resize columns and format cells
+			$requests = [ 
+				new Google_Service_Sheets_Request( [ 
+					'autoResizeDimensions' => [ 
+						'dimensions' => [ 
+							'sheetId' => 0,
+							'dimension' => 'COLUMNS',
+							'startIndex' => 0,
+							'endIndex' => count( $values[0] )
+						]
+					]
+				] ),
+				// Make header bold
+				new Google_Service_Sheets_Request( [ 
+					'repeatCell' => [ 
+						'range' => [ 
+							'sheetId' => 0,
+							'startRowIndex' => 0,
+							'endRowIndex' => 1
+						],
+						'cell' => [ 
+							'userEnteredFormat' => [ 
+								'textFormat' => [ 
+									'bold' => true
+								]
+							]
+						],
+						'fields' => 'userEnteredFormat.textFormat.bold'
+					]
+				] ),
+				// Format Item Price column as number
+				new Google_Service_Sheets_Request( [ 
+					'repeatCell' => [ 
+						'range' => [ 
+							'sheetId' => 0,
+							'startRowIndex' => 1,
+							'startColumnIndex' => 9, // Index of Item Price column
+							'endColumnIndex' => 10
+						],
+						'cell' => [ 
+							'userEnteredFormat' => [ 
+								'numberFormat' => [ 
+									'type' => 'NUMBER',
+									'pattern' => '#,##0.00'
+								]
+							]
+						],
+						'fields' => 'userEnteredFormat.numberFormat'
+					]
+				] ),
+				// Format Total Price column as number
+				new Google_Service_Sheets_Request( [ 
+					'repeatCell' => [ 
+						'range' => [ 
+							'sheetId' => 0,
+							'startRowIndex' => 1,
+							'startColumnIndex' => 10, // Index of Total Price column
+							'endColumnIndex' => 11
+						],
+						'cell' => [ 
+							'userEnteredFormat' => [ 
+								'numberFormat' => [ 
+									'type' => 'NUMBER',
+									'pattern' => '#,##0.00'
+								]
+							]
+						],
+						'fields' => 'userEnteredFormat.numberFormat'
+					]
+				] ),
+				// Format Order Date column as date
+				new Google_Service_Sheets_Request( [ 
+					'repeatCell' => [ 
+						'range' => [ 
+							'sheetId' => 0,
+							'startRowIndex' => 1,
+							'startColumnIndex' => 11, // Index of Order Date column
+							'endColumnIndex' => 12
+						],
+						'cell' => [ 
+							'userEnteredFormat' => [ 
+								'numberFormat' => [ 
+									'type' => 'DATE',
+									'pattern' => 'mm/dd/yyyy'
+								]
+							]
+						],
+						'fields' => 'userEnteredFormat.numberFormat'
+					]
+				] )
+			];
+
+			$batchUpdateRequest = new Google_Service_Sheets_BatchUpdateSpreadsheetRequest( [ 
+				'requests' => $requests
+			] );
+
+			$service->spreadsheets->batchUpdate( $spreadsheet_id, $batchUpdateRequest );
+
+			// Save the sheet URL
+			$sheet_url = "https://docs.google.com/spreadsheets/d/{$spreadsheet_id}";
+			update_option( 'hineon_orders_sheet_url', $sheet_url );
+
+			// Add last updated timestamp
+			update_option( 'hineon_orders_sheet_last_updated', current_time( 'mysql' ) );
+
+		} catch (Exception $e) {
+			wp_die( 'Error exporting to Google Sheets: ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * Auto export to sheets when order is created or status changes
+	 */
+	public function auto_export_to_sheets() {
+		// Don't run if we're doing AJAX or in admin
+		if ( wp_doing_ajax() ) {
+			return;
+		}
+
+		// Run the export in the background after 1 minute to ensure order data is fully processed
+		wp_schedule_single_event( time() + 60, 'do_hineon_sheets_export' );
+	}
+
+	/**
+	 * Background export handler
+	 */
+	public function do_sheets_export() {
+		try {
+			$this->export_orders_to_sheets();
+		} catch (Exception $e) {
+			error_log( 'hineon Sheets Export Error: ' . $e->getMessage() );
+		}
+	}
+}
