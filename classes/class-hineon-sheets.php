@@ -39,6 +39,25 @@ class HineonSheets {
 	}
 
 	/**
+	 * Check if email is from a custom domain
+	 * 
+	 * @param string $email
+	 * @return bool
+	 */
+	public function is_custom_email_domain( $email ) {
+		$email = trim( $email );
+		if ( empty( $email ) || strpos( $email, '@' ) === false ) {
+			return false;
+		}
+
+		$common_domains = array( 'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com' );
+		$email_parts = explode( '@', $email );
+		$email_domain = strtolower( trim( end( $email_parts ) ) );
+
+		return ! in_array( $email_domain, $common_domains );
+	}
+
+	/**
 	 * Debug
 	 */
 
@@ -538,28 +557,33 @@ class HineonSheets {
 			}
 
 			//check if order email is from a custom domain
-			$order_email = $order->get_billing_email();
-			$common_domains = array('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com','icloud.com');
-			$order_email_flag = false;
-			if($order_email && !in_array($order_email, $common_domains)){
-				$order_email_flag = true;
-			}
+			$order_email_flag = $this->is_custom_email_domain( $order->get_billing_email() );
 
 			//check if user is a repeat customer
 			$user_id = $order->get_user_id();
+			$order_email = $order->get_billing_email();
 			$args = array(
-				'customer_id' => $user_id,
 				'limit'       => -1, // Use -1 to get all orders, or a number (e.g., 10) for recent ones
 				'status'      => 'completed', 
 			);
+			
+			if ( $user_id ) {
+				$args['customer_id'] = $user_id;
+			} elseif ( $order_email ) {
+				$args['billing_email'] = $order_email;
+			}
 
-			$orders = wc_get_orders( $args );
+			$orders = array();
+			if ( ! empty( $args['customer_id'] ) || ! empty( $args['billing_email'] ) ) {
+				$orders = wc_get_orders( $args );
+			}
+			
 			$order_repeat_flag = false;
 			if(count($orders) > 1){
 				$order_repeat_flag = true;
 			}
 
-			if($order_total_flag || $order_email_flag || $order_repeat_flag){
+			if($order_total_flag && $order_email_flag && $order_repeat_flag){
 				$this->add_to_summary_sheet($order_id);
 			}
 		}
@@ -574,6 +598,11 @@ class HineonSheets {
 		$order = wc_get_order( $order_id );
 		if ( ! $order ) {
 			return;
+		}
+
+		$email = $order->get_billing_email();
+		if ( ! $this->is_custom_email_domain( $email ) ) {
+			return; // Safeguard: Never add non-custom domains to summary sheet
 		}
 
 		if ( ! class_exists( 'Google_Client' ) ) {
@@ -661,13 +690,42 @@ class HineonSheets {
 				'limit' => -1,
 				'status' => [ 'completed', 'processing', 'on-hold' ]
 			] );
-			$total_orders = count( $customer_orders );
+			$total_orders = is_array($customer_orders) ? count( $customer_orders ) : 0;
 
 			if ( $found_row_index > -1 ) {
 				// Update # of Orders (Column H -> index 7)
 				// Row index is 0-based, Sheets API is 1-based
-				$update_range = 'Hineon Companies!H' . ( $found_row_index + 1 );
-				$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
+				$row_number = $found_row_index + 1;
+				
+				// Check if summary (Column I -> index 8) is missing
+				$current_summary = isset( $rows[$found_row_index][8] ) ? $rows[$found_row_index][8] : '';
+				
+				if ( empty( $current_summary ) ) {
+					if ( class_exists( 'WP_CLI' ) ) {
+						WP_CLI::log( "Summary missing for existing entry ($email). Fetching from Gemini..." );
+					}
+					$new_summary = $this->get_company_summary_from_gemini( $email );
+					if ( ! empty( $new_summary ) ) {
+						if ( class_exists( 'WP_CLI' ) ) {
+							WP_CLI::log( "Summary received: " . substr( $new_summary, 0, 50 ) . "..." );
+						}
+						// Update both Orders and Summary
+						$update_range = 'Hineon Companies!H' . $row_number . ':I' . $row_number;
+						$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders, $new_summary ] ] ] );
+					} else {
+						if ( class_exists( 'WP_CLI' ) ) {
+							WP_CLI::log( "Gemini returned empty summary." );
+						}
+						// Only update Orders
+						$update_range = 'Hineon Companies!H' . $row_number;
+						$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
+					}
+				} else {
+					// Summary exists, only update Orders
+					$update_range = 'Hineon Companies!H' . $row_number;
+					$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
+				}
+
 				$service->spreadsheets_values->update(
 					$spreadsheet_id,
 					$update_range,
@@ -687,7 +745,13 @@ class HineonSheets {
 				$reg_date = $user ? date( 'Y-m-d', strtotime( $user->user_registered ) ) : $order->get_date_created()->date( 'Y-m-d' );
 				
 				// Gemini API Call
+				if ( class_exists( 'WP_CLI' ) ) {
+					WP_CLI::log( "Fetching company summary from Gemini for: " . $email );
+				}
 				$summary = $this->get_company_summary_from_gemini( $email );
+				if ( class_exists( 'WP_CLI' ) ) {
+					WP_CLI::log( "Summary received: " . ( ! empty( $summary ) ? substr( $summary, 0, 50 ) . "..." : "EMPTY" ) );
+				}
 
 				$new_row = [
 					$email,
@@ -721,12 +785,12 @@ class HineonSheets {
 			return '';
 		}
 
-		$url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' . $api_key;
+		$url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=' . $api_key;
 
 		$body = [
 			'system_instruction' => [
 				'parts' => [
-					[ 'text' => 'You are a company data scraper, you will be given an email and you will find any data from it and create a summary on what the company does. DONT INCLUDE PREAMBLES and COMMENTARIES while the user prompt is the email' ]
+					[ 'text' => 'You are a company data scraper, you will be given an email and you will find any data from it and create a summary on what the company does. DONT INCLUDE PREAMBLES and COMMENTARIES while the user prompt is the email. If you can not find any data from the email, return "No data found". If you think the email is not from a company and from an email provider like gmail for example, return "Not a company".' ]
 				]
 			],
 			'contents' => [
@@ -746,13 +810,29 @@ class HineonSheets {
 		] );
 
 		if ( is_wp_error( $response ) ) {
+			if ( class_exists( 'WP_CLI' ) ) {
+				WP_CLI::error( "WP Remote Post Error: " . $response->get_error_message(), false );
+			}
 			return '';
 		}
 
-		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+		$http_code = wp_remote_retrieve_response_code( $response );
+		$response_body = wp_remote_retrieve_body( $response );
+		$data = json_decode( $response_body, true );
+
+		if ( $http_code !== 200 ) {
+			if ( class_exists( 'WP_CLI' ) ) {
+				WP_CLI::error( "Gemini API HTTP Error ($http_code): " . $response_body, false );
+			}
+			return '';
+		}
 
 		if ( isset( $data['candidates'][0]['content']['parts'][0]['text'] ) ) {
 			return trim( $data['candidates'][0]['content']['parts'][0]['text'] );
+		}
+
+		if ( class_exists( 'WP_CLI' ) ) {
+			WP_CLI::log( "Gemini API Unexpected Response Structure: " . substr( $response_body, 0, 500 ) );
 		}
 
 		return '';
