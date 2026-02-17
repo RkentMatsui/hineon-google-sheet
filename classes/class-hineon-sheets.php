@@ -35,6 +35,7 @@ class HineonSheets {
 		add_action( 'woocommerce_order_status_changed', array( $this, 'auto_export_to_sheets' ) );
 		add_action( 'do_hineon_sheets_export', array( $this, 'do_sheets_export' ) );
 		//add_action( 'wp_footer', array( $this, 'debug' ) );
+		add_action( 'woocommerce_payment_complete', array( $this, 'add_to_summary_sheet_trigger' ) );
 	}
 
 	/**
@@ -516,4 +517,248 @@ class HineonSheets {
 			error_log( 'hineon Sheets Export Error: ' . $e->getMessage() );
 		}
 	}
+
+	public function add_to_summary_sheet_trigger( $order_id ){
+		$order = null;
+		if ( ! class_exists( 'Google_Client' ) ) {
+			require_once get_template_directory() . '/vendor/autoload.php';
+		}
+
+		// Get the order object
+		if($order_id ){
+			$order = wc_get_order( $order_id );	
+		}
+		
+		if($order){
+			//check if order goes above 1000
+			$order_total = $order->get_total();
+			$order_total_flag = false;
+			if($order_total > 1000){
+				$order_total_flag = true;
+			}
+
+			//check if order email is from a custom domain
+			$order_email = $order->get_billing_email();
+			$common_domains = array('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com','icloud.com');
+			$order_email_flag = false;
+			if($order_email && !in_array($order_email, $common_domains)){
+				$order_email_flag = true;
+			}
+
+			//check if user is a repeat customer
+			$user_id = $order->get_user_id();
+			$args = array(
+				'customer_id' => $user_id,
+				'limit'       => -1, // Use -1 to get all orders, or a number (e.g., 10) for recent ones
+				'status'      => 'completed', 
+			);
+
+			$orders = wc_get_orders( $args );
+			$order_repeat_flag = false;
+			if(count($orders) > 1){
+				$order_repeat_flag = true;
+			}
+
+			if($order_total_flag || $order_email_flag || $order_repeat_flag){
+				$this->add_to_summary_sheet($order_id);
+			}
+		}
+
+	}
+
+	function add_to_summary_sheet( $order_id = null ){
+		if ( ! $order_id ) {
+			return;
+		}
+
+		$order = wc_get_order( $order_id );
+		if ( ! $order ) {
+			return;
+		}
+
+		if ( ! class_exists( 'Google_Client' ) ) {
+			require_once get_template_directory() . '/vendor/autoload.php';
+		}
+
+		try {
+			$client = new Google_Client();
+			$client->setApplicationName( 'Hineon Summary Sheet' );
+			// Set full access scope
+			$client->setScopes( [ 
+				Google_Service_Sheets::SPREADSHEETS,
+				Google_Service_Sheets::DRIVE,
+				Google_Service_Sheets::DRIVE_FILE
+			] );
+
+			// Get credentials from WordPress options
+			$spreadsheet_id = get_field( 'google_sheet_summary', 'option' );
+
+			$credentials_json_file = get_field( 'google_api_json', 'option' );
+
+			$credentials = str_replace(
+				site_url(),
+				ABSPATH,
+				$credentials_json_file['url']
+			);
+
+			if ( empty( $credentials ) ) {
+				return;
+			}
+
+			if ( empty( $spreadsheet_id ) ) {
+				return;
+			}
+
+			$client->setAuthConfig( $credentials );
+
+			$service = new Google_Service_Sheets( $client );
+
+			// Check and setup headers
+			$range = 'Hineon Companies!A:I'; 
+			try {
+				$response = $service->spreadsheets_values->get( $spreadsheet_id, $range );
+				$rows = $response->getValues();
+			} catch ( Exception $e ) {
+				$rows = [];
+			}
+
+			$headers = [ 'Email', 'First Name', 'Last Name', 'City', 'State', 'Country', 'Registration Date', '# of Orders', 'Company Summary' ];
+			
+			// If sheet is empty or headers don't match, reset it
+			if ( empty( $rows ) || ( isset( $rows[0] ) && $rows[0] !== $headers ) ) {
+				$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ $headers ] ] );
+				// Clear first
+				$clear_request = new Google_Service_Sheets_ClearValuesRequest();
+				$service->spreadsheets_values->clear( $spreadsheet_id, 'Hineon Companies', $clear_request );
+				
+				// Append headers
+				$service->spreadsheets_values->append(
+					$spreadsheet_id,
+					'Hineon Companies!A1',
+					$body,
+					[ 'valueInputOption' => 'USER_ENTERED' ]
+				);
+				$rows = [ $headers ]; // Update local cache
+			}
+
+			$email = $order->get_billing_email();
+			if ( empty( $email ) ) {
+				return;
+			}
+
+			$found_row_index = -1;
+			// Find email in column A (index 0)
+			foreach ( $rows as $index => $row ) {
+				if ( isset( $row[0] ) && strcasecmp( $row[0], $email ) === 0 ) {
+					$found_row_index = $index;
+					break;
+				}
+			}
+
+			// Calculate total orders
+			$customer_orders = wc_get_orders( [
+				'billing_email' => $email,
+				'limit' => -1,
+				'status' => [ 'completed', 'processing', 'on-hold' ]
+			] );
+			$total_orders = count( $customer_orders );
+
+			if ( $found_row_index > -1 ) {
+				// Update # of Orders (Column H -> index 7)
+				// Row index is 0-based, Sheets API is 1-based
+				$update_range = 'Hineon Companies!H' . ( $found_row_index + 1 );
+				$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
+				$service->spreadsheets_values->update(
+					$spreadsheet_id,
+					$update_range,
+					$body,
+					[ 'valueInputOption' => 'USER_ENTERED' ]
+				);
+			} else {
+				// New entry
+				$first_name = $order->get_billing_first_name();
+				$last_name = $order->get_billing_last_name();
+				$city = $order->get_billing_city();
+				$state = $order->get_billing_state();
+				$country = $order->get_billing_country();
+				
+				$user_id = $order->get_user_id();
+				$user = $user_id ? get_userdata( $user_id ) : null;
+				$reg_date = $user ? date( 'Y-m-d', strtotime( $user->user_registered ) ) : $order->get_date_created()->date( 'Y-m-d' );
+				
+				// Gemini API Call
+				$summary = $this->get_company_summary_from_gemini( $email );
+
+				$new_row = [
+					$email,
+					$first_name,
+					$last_name,
+					$city,
+					$state,
+					$country,
+					$reg_date,
+					$total_orders,
+					$summary
+				];
+
+				$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ $new_row ] ] );
+				$service->spreadsheets_values->append(
+					$spreadsheet_id,
+					'Hineon Companies!A1',
+					$body,
+					[ 'valueInputOption' => 'USER_ENTERED' ]
+				);
+			}
+
+		} catch (Exception $e) {
+			error_log( 'Hineon Summary Sheet Error: ' . $e->getMessage() );
+		}
+	}
+
+	private function get_company_summary_from_gemini( $email ) {
+		$api_key = get_field( 'gemini_api_key', 'option' );
+		if ( empty( $api_key ) ) {
+			return '';
+		}
+
+		$url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' . $api_key;
+
+		$body = [
+			'system_instruction' => [
+				'parts' => [
+					[ 'text' => 'You are a company data scraper, you will be given an email and you will find any data from it and create a summary on what the company does. DONT INCLUDE PREAMBLES and COMMENTARIES while the user prompt is the email' ]
+				]
+			],
+			'contents' => [
+				[
+					'role' => 'user',
+					'parts' => [
+						[ 'text' => $email ]
+					]
+				]
+			]
+		];
+
+		$response = wp_remote_post( $url, [
+			'body'    => json_encode( $body ),
+			'headers' => [ 'Content-Type' => 'application/json' ],
+			'timeout' => 30
+		] );
+
+		if ( is_wp_error( $response ) ) {
+			return '';
+		}
+
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		if ( isset( $data['candidates'][0]['content']['parts'][0]['text'] ) ) {
+			return trim( $data['candidates'][0]['content']['parts'][0]['text'] );
+		}
+
+		return '';
+	}
+		
+	
+
+	
 }
