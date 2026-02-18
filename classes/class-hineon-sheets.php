@@ -547,7 +547,6 @@ class HineonSheets {
 		if($order_id ){
 			$order = wc_get_order( $order_id );	
 		}
-		
 		if($order){
 			//check if order goes above 1000
 			$order_total = $order->get_total();
@@ -583,7 +582,7 @@ class HineonSheets {
 				$order_repeat_flag = true;
 			}
 
-			if($order_total_flag && $order_email_flag && $order_repeat_flag){
+			if($order_total_flag || $order_email_flag || $order_repeat_flag){
 				$this->add_to_summary_sheet($order_id);
 			}
 		}
@@ -599,11 +598,10 @@ class HineonSheets {
 		if ( ! $order ) {
 			return;
 		}
-
 		$email = $order->get_billing_email();
-		if ( ! $this->is_custom_email_domain( $email ) ) {
-			return; // Safeguard: Never add non-custom domains to summary sheet
-		}
+		// if ( ! $this->is_custom_email_domain( $email ) ) {
+		// 	return; // Safeguard: Never add non-custom domains to summary sheet
+		// }
 
 		if ( ! class_exists( 'Google_Client' ) ) {
 			require_once get_template_directory() . '/vendor/autoload.php';
@@ -630,10 +628,6 @@ class HineonSheets {
 				$credentials_json_file['url']
 			);
 
-			if ( empty( $credentials ) ) {
-				return;
-			}
-
 			if ( empty( $spreadsheet_id ) ) {
 				return;
 			}
@@ -643,7 +637,7 @@ class HineonSheets {
 			$service = new Google_Service_Sheets( $client );
 
 			// Check and setup headers
-			$range = 'Hineon Companies!A:I'; 
+			$range = 'Hineon Companies!A:N'; 
 			try {
 				$response = $service->spreadsheets_values->get( $spreadsheet_id, $range );
 				$rows = $response->getValues();
@@ -651,7 +645,7 @@ class HineonSheets {
 				$rows = [];
 			}
 
-			$headers = [ 'Email', 'First Name', 'Last Name', 'City', 'State', 'Country', 'Registration Date', '# of Orders', 'Company Summary' ];
+			$headers = [ 'Email', 'First Name', 'Last Name','Phone Number', 'City', 'State', 'Country', 'Registration Date','Order #','Item stock code', 'Price' , '# of Orders','Company Name', 'Company Summary' ];
 			
 			// If sheet is empty or headers don't match, reset it
 			if ( empty( $rows ) || ( isset( $rows[0] ) && $rows[0] !== $headers ) ) {
@@ -675,94 +669,106 @@ class HineonSheets {
 				return;
 			}
 
-			$found_row_index = -1;
-			// Find email in column A (index 0)
+			// Search for existing rows with this email to reuse company data
+			$existing_company_name = '';
+			$existing_summary = '';
 			foreach ( $rows as $index => $row ) {
 				if ( isset( $row[0] ) && strcasecmp( $row[0], $email ) === 0 ) {
-					$found_row_index = $index;
-					break;
+					// Found existing row with same email - get company name and summary
+					$existing_company_name = isset( $row[12] ) ? $row[12] : ''; // Column M: Company Name
+					$existing_summary = isset( $row[13] ) ? $row[13] : ''; // Column N: Company Summary
+					if ( ! empty( $existing_company_name ) || ! empty( $existing_summary ) ) {
+						break; // Use the first match found
+					}
 				}
 			}
 
-			// Calculate total orders
+			// Calculate total orders and gather order details
 			$customer_orders = wc_get_orders( [
 				'billing_email' => $email,
 				'limit' => -1,
 				'status' => [ 'completed', 'processing', 'on-hold' ]
 			] );
 			$total_orders = is_array($customer_orders) ? count( $customer_orders ) : 0;
-
-			if ( $found_row_index > -1 ) {
-				// Update # of Orders (Column H -> index 7)
-				// Row index is 0-based, Sheets API is 1-based
-				$row_number = $found_row_index + 1;
-				
-				// Check if summary (Column I -> index 8) is missing
-				$current_summary = isset( $rows[$found_row_index][8] ) ? $rows[$found_row_index][8] : '';
-				
-				if ( empty( $current_summary ) ) {
-					if ( class_exists( 'WP_CLI' ) ) {
-						WP_CLI::log( "Summary missing for existing entry ($email). Fetching from Gemini..." );
-					}
-					$new_summary = $this->get_company_summary_from_gemini( $email );
-					if ( ! empty( $new_summary ) ) {
-						if ( class_exists( 'WP_CLI' ) ) {
-							WP_CLI::log( "Summary received: " . substr( $new_summary, 0, 50 ) . "..." );
-						}
-						// Update both Orders and Summary
-						$update_range = 'Hineon Companies!H' . $row_number . ':I' . $row_number;
-						$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders, $new_summary ] ] ] );
-					} else {
-						if ( class_exists( 'WP_CLI' ) ) {
-							WP_CLI::log( "Gemini returned empty summary." );
-						}
-						// Only update Orders
-						$update_range = 'Hineon Companies!H' . $row_number;
-						$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
-					}
-				} else {
-					// Summary exists, only update Orders
-					$update_range = 'Hineon Companies!H' . $row_number;
-					$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ [ $total_orders ] ] ] );
+			
+			// Calculate total spent and get last order details
+			$total_spent = 0;
+			$last_order_date = '';
+			$last_order_id = '';
+			$last_order_number = '';
+			$last_products = '';
+			$last_item_price = 0;
+			
+			if ( ! empty( $customer_orders ) ) {
+				foreach ( $customer_orders as $cust_order ) {
+					$total_spent += $cust_order->get_total();
 				}
-
-				$service->spreadsheets_values->update(
-					$spreadsheet_id,
-					$update_range,
-					$body,
-					[ 'valueInputOption' => 'USER_ENTERED' ]
-				);
+				
+				// Get last order details
+				$last_order = $customer_orders[0];
+				$last_order_date = $last_order->get_date_created()->date( 'Y-m-d' );
+				$last_order_id = $last_order->get_order_number();
+				$last_order_number = $last_order->get_order_number();
+				
+				// Get product names and calculate item price from last order
+				$items = $last_order->get_items();
+				$product_names = [];
+				foreach ( $items as $item ) {
+					$product_names[] = $item->get_name();
+					$last_item_price += $item->get_total();
+				}
+				$last_products = implode( ', ', $product_names );
+				$last_item_price = number_format( $last_item_price, 2 );
+			}
+			
+			$phone = $order->get_billing_phone();
+			
+			// Use existing company name if available, otherwise get from current order
+			if ( ! empty( $existing_company_name ) ) {
+				$company_name = $existing_company_name;
 			} else {
-				// New entry
-				$first_name = $order->get_billing_first_name();
-				$last_name = $order->get_billing_last_name();
-				$city = $order->get_billing_city();
-				$state = $order->get_billing_state();
-				$country = $order->get_billing_country();
-				
-				$user_id = $order->get_user_id();
-				$user = $user_id ? get_userdata( $user_id ) : null;
-				$reg_date = $user ? date( 'Y-m-d', strtotime( $user->user_registered ) ) : $order->get_date_created()->date( 'Y-m-d' );
-				
-				// Gemini API Call
-				if ( class_exists( 'WP_CLI' ) ) {
-					WP_CLI::log( "Fetching company summary from Gemini for: " . $email );
-				}
-				$summary = $this->get_company_summary_from_gemini( $email );
-				if ( class_exists( 'WP_CLI' ) ) {
-					WP_CLI::log( "Summary received: " . ( ! empty( $summary ) ? substr( $summary, 0, 50 ) . "..." : "EMPTY" ) );
-				}
+				$company_name = $order->get_billing_company();
+			}
 
+			// Always add a new row for each order (allow duplicates)
+			$first_name = $order->get_billing_first_name();
+			$last_name = $order->get_billing_last_name();
+			$city = $order->get_billing_city();
+			$state = $order->get_billing_state();
+			$country = $order->get_billing_country();
+			
+			$user_id = $order->get_user_id();
+			$user = $user_id ? get_userdata( $user_id ) : null;
+			$reg_date = $user ? date( 'Y-m-d', strtotime( $user->user_registered ) ) : $order->get_date_created()->date( 'Y-m-d' );
+			
+			// Use existing summary and company name if available, otherwise fetch from Gemini
+			if ( ! empty( $existing_summary ) || ! empty( $existing_company_name ) ) {
+				$summary = $existing_summary;
+				// company_name already set above from existing data
+			} else {
+				$gemini_data = $this->get_company_data_from_gemini( $email );
+				$summary = $gemini_data['summary'];
+				if ( ! empty( $gemini_data['company_name'] ) ) {
+					$company_name = $gemini_data['company_name'];
+				}
+			}
+
+				// Headers: Email, First Name, Last Name, Phone Number, City, State, Country, Registration Date, Order #, Item stock code, Price, # of Orders, Company Name, Company Summary
 				$new_row = [
-					$email,
-					$first_name,
-					$last_name,
-					$city,
-					$state,
-					$country,
-					$reg_date,
-					$total_orders,
-					$summary
+					$email,                  // A: Email
+					$first_name,             // B: First Name
+					$last_name,              // C: Last Name
+					$phone,                  // D: Phone Number
+					$city,                   // E: City
+					$state,                  // F: State
+					$country,                // G: Country
+					$reg_date,               // H: Registration Date
+					$last_order_number,      // I: Order #
+					$last_products,          // J: Item stock code (product names)
+					$last_item_price,        // K: Price
+					$total_orders,           // L: # of Orders
+					$company_name,           // M: Company Name
+					$summary                 // N: Company Summary
 				];
 
 				$body = new Google_Service_Sheets_ValueRange( [ 'values' => [ $new_row ] ] );
@@ -772,17 +778,16 @@ class HineonSheets {
 					$body,
 					[ 'valueInputOption' => 'USER_ENTERED' ]
 				);
-			}
 
 		} catch (Exception $e) {
 			error_log( 'Hineon Summary Sheet Error: ' . $e->getMessage() );
 		}
 	}
 
-	private function get_company_summary_from_gemini( $email ) {
+	private function get_company_data_from_gemini( $email ) {
 		$api_key = get_field( 'gemini_api_key', 'option' );
 		if ( empty( $api_key ) ) {
-			return '';
+			return [ 'company_name' => '', 'summary' => '' ];
 		}
 
 		$url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=' . $api_key;
@@ -790,7 +795,23 @@ class HineonSheets {
 		$body = [
 			'system_instruction' => [
 				'parts' => [
-					[ 'text' => 'You are a company data scraper, you will be given an email and you will find any data from it and create a summary on what the company does. DONT INCLUDE PREAMBLES and COMMENTARIES while the user prompt is the email. If you can not find any data from the email, return "No data found". If you think the email is not from a company and from an email provider like gmail for example, return "Not a company".' ]
+					[ 'text' => 'You are a company data scraper. You will be given an email address and you will find any data from it and create a summary on what the company does. 
+					IMPORTANT: Return your response in this exact format:
+					Company Name: [company name]
+					Location: [location]
+					Industry: [industry]
+					Core Services: [list of core services]
+					Summary: [brief company summary]
+
+					If you cannot find any data from the email, return:
+					Company Name: Unknown
+					Summary: No data found
+
+					If the email is from a personal email provider (gmail, yahoo, hotmail, etc), return:
+					Company Name: Personal Email
+					Summary: Not a company
+
+					DO NOT include any preambles, commentaries, or additional text.' ]
 				]
 			],
 			'contents' => [
@@ -810,10 +831,7 @@ class HineonSheets {
 		] );
 
 		if ( is_wp_error( $response ) ) {
-			if ( class_exists( 'WP_CLI' ) ) {
-				WP_CLI::error( "WP Remote Post Error: " . $response->get_error_message(), false );
-			}
-			return '';
+			return [ 'company_name' => '', 'summary' => '' ];
 		}
 
 		$http_code = wp_remote_retrieve_response_code( $response );
@@ -821,21 +839,70 @@ class HineonSheets {
 		$data = json_decode( $response_body, true );
 
 		if ( $http_code !== 200 ) {
-			if ( class_exists( 'WP_CLI' ) ) {
-				WP_CLI::error( "Gemini API HTTP Error ($http_code): " . $response_body, false );
-			}
-			return '';
+			return [ 'company_name' => '', 'summary' => '' ];
 		}
 
 		if ( isset( $data['candidates'][0]['content']['parts'][0]['text'] ) ) {
-			return trim( $data['candidates'][0]['content']['parts'][0]['text'] );
+			$text = trim( $data['candidates'][0]['content']['parts'][0]['text'] );
+			
+			// Parse the response to extract all fields
+			$company_name = '';
+			$location = '';
+			$industry = '';
+			$core_services = '';
+			$summary_text = '';
+			
+			// Look for "Company Name: " pattern
+			if ( preg_match( '/Company Name:\s*(.+?)(?:\n|$)/i', $text, $name_matches ) ) {
+				$company_name = trim( $name_matches[1] );
+			}
+			
+			// Look for "Location: " pattern
+			if ( preg_match( '/Location:\s*(.+?)(?:\n|$)/i', $text, $location_matches ) ) {
+				$location = trim( $location_matches[1] );
+			}
+			
+			// Look for "Industry: " pattern
+			if ( preg_match( '/Industry:\s*(.+?)(?:\n|$)/i', $text, $industry_matches ) ) {
+				$industry = trim( $industry_matches[1] );
+			}
+			
+			// Look for "Core Services: " pattern
+			if ( preg_match( '/Core Services:\s*(.+?)(?:\n|Summary:|$)/is', $text, $services_matches ) ) {
+				$core_services = trim( $services_matches[1] );
+			}
+			
+			// Look for "Summary: " pattern
+			if ( preg_match( '/Summary:\s*(.+)/is', $text, $summary_matches ) ) {
+				$summary_text = trim( $summary_matches[1] );
+			}
+			
+			// Build formatted summary with all extracted fields
+			$summary_parts = [];
+			if ( ! empty( $location ) ) {
+				$summary_parts[] = "Location: " . $location;
+			}
+			if ( ! empty( $industry ) ) {
+				$summary_parts[] = "Industry: " . $industry;
+			}
+			if ( ! empty( $core_services ) ) {
+				$summary_parts[] = "Core Services: " . $core_services;
+			}
+			if ( ! empty( $summary_text ) ) {
+				$summary_parts[] = "Summary: " . $summary_text;
+			}
+			
+			$summary = implode( "\n", $summary_parts );
+			
+			// If parsing failed, use the whole text as summary
+			if ( empty( $company_name ) && empty( $summary ) ) {
+				$summary = $text;
+			}
+			
+			return [ 'company_name' => $company_name, 'summary' => $summary ];
 		}
 
-		if ( class_exists( 'WP_CLI' ) ) {
-			WP_CLI::log( "Gemini API Unexpected Response Structure: " . substr( $response_body, 0, 500 ) );
-		}
-
-		return '';
+		return [ 'company_name' => '', 'summary' => '' ];
 	}
 		
 	
